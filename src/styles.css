@@ -165,15 +165,23 @@ h1 {
   color: var(--danger);
 }
 
-.paper-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 0.55rem;
+.size-card .field {
+  margin-top: 0;
 }
 
-.paper-row .segmented {
-  width: 100%;
+.size-presets {
+  margin: 0.55rem 0 0.85rem;
+}
+
+.size-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.size-grid .segmented {
+  min-height: var(--tap);
+  align-items: center;
 }
 
 .paper-row span,

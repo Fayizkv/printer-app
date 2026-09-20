@@ -3,11 +3,15 @@ import {
   PAPER_PRESETS,
   canvasToPreviewUrl,
   ditherCanvas,
+  dotsFromMm,
   drawImageToCanvas,
   loadImageElement,
-  buildRasterJob,
+  loadPrinterSize,
+  mmFromDots,
+  normalizeDots,
+  printCanvas,
   renderTextCanvas,
-  writeInChunks,
+  savePrinterSize,
 } from './escpos';
 
 const PRINTER_PROFILES = [
@@ -40,7 +44,7 @@ export default function App() {
   const [mode, setMode] = useState('text');
   const [text, setText] = useState('');
   const [status, setStatus] = useState('Paste text or add a photo, then print.');
-  const [paperId, setPaperId] = useState('58');
+  const [printerSize, setPrinterSize] = useState(() => loadPrinterSize());
   const [appUrlTemplate, setAppUrlTemplate] = useState('');
   const [serviceUuid, setServiceUuid] = useState(DEFAULT_SERVICE_UUID);
   const [characteristicUuid, setCharacteristicUuid] = useState(DEFAULT_CHARACTERISTIC_UUID);
@@ -56,8 +60,41 @@ export default function App() {
   const galleryRef = useRef(null);
   const cameraRef = useRef(null);
   const [imageTick, setImageTick] = useState(0);
-  const paperDots = useMemo(() => PAPER_PRESETS.find((item) => item.id === paperId)?.dots ?? 384, [paperId]);
+  const paperDots = printerSize.dots;
   const connected = Boolean(characteristic);
+  const activePresetId = useMemo(() => {
+    const match = PAPER_PRESETS.find(
+      (preset) =>
+        preset.paperMm === Number(printerSize.paperMm) &&
+        preset.dots === printerSize.dots &&
+        preset.dpi === printerSize.dpi,
+    );
+    return match?.id || 'custom';
+  }, [printerSize]);
+
+  const updatePrinterSize = (patch) => {
+    setPrinterSize((current) => {
+      const next = { ...current, ...patch, id: patch.id || 'custom' };
+      next.dpi = Number(next.dpi) === 300 ? 300 : 203;
+      next.paperMm = Math.max(1, Math.min(112, Number(next.paperMm) || 58));
+      next.dots = normalizeDots(next.dots);
+      next.printableMm = mmFromDots(next.dots, next.dpi);
+      savePrinterSize(next);
+      return next;
+    });
+  };
+
+  const applyPreset = (preset) => {
+    const next = {
+      id: preset.id,
+      paperMm: preset.paperMm,
+      printableMm: preset.printableMm,
+      dpi: preset.dpi,
+      dots: preset.dots,
+    };
+    savePrinterSize(next);
+    setPrinterSize(next);
+  };
 
   const queueImage = (source, name = 'image') => {
     originalImageRef.current = source;
@@ -72,8 +109,12 @@ export default function App() {
     (async () => {
       try {
         const image = await loadImageElement(originalImageRef.current);
-        if (cancelled) return;
+        if (cancelled) {
+          image.close?.();
+          return;
+        }
         const canvas = ditherCanvas(drawImageToCanvas(image, paperDots), invert);
+        image.close?.();
         imageCanvasRef.current = canvas;
         setPreviewUrl(canvasToPreviewUrl(canvas));
         setStatus(`Ready to print ${imageName || 'image'}`);
@@ -183,15 +224,20 @@ export default function App() {
     setStatus('Printer disconnected');
   };
 
-  const sendBytes = async (bytes) => {
+  const sendCanvas = async (canvas, label) => {
     if (!characteristic) {
       setStatus('Connect a BLE printer first, or use Print via iPhone app.');
       return;
     }
     setIsPrinting(true);
     try {
-      setStatus(`Sending ${bytes.length} bytes to ${device?.name || 'printer'}...`);
-      await writeInChunks(characteristic, bytes);
+      setStatus(`Sending ${label} to ${device?.name || 'printer'}...`);
+      await printCanvas(characteristic, canvas, {
+        onProgress: (sent, total) => {
+          const percent = total ? Math.min(99, Math.round((sent / total) * 100)) : 0;
+          setStatus(`Printing ${label}… ${percent}%`);
+        },
+      });
       setStatus('Print job sent');
     } catch (error) {
       setStatus(`Print failed: ${error?.message || error}`);
@@ -206,8 +252,7 @@ export default function App() {
       setStatus('Paste or type some text first');
       return;
     }
-    const canvas = renderTextCanvas(value, paperDots);
-    await sendBytes(buildRasterJob(canvas));
+    await sendCanvas(renderTextCanvas(value, paperDots), 'text');
   };
 
   const printImage = async () => {
@@ -215,7 +260,7 @@ export default function App() {
       setStatus('Upload or paste an image first');
       return;
     }
-    await sendBytes(buildRasterJob(imageCanvasRef.current));
+    await sendCanvas(imageCanvasRef.current, 'photo');
   };
 
   const printNow = () => {
@@ -287,17 +332,82 @@ export default function App() {
           ) : null}
         </div>
         {activeProfile ? <p className="hint">{device?.name || 'Printer'} · {activeProfile} · {paperDots} dots</p> : null}
-        <div className="paper-row">
-          <span>Paper</span>
-          <div className="segmented">
-            {PAPER_PRESETS.map((preset) => (
-              <button key={preset.id} className={paperId === preset.id ? 'active' : ''} onClick={() => setPaperId(preset.id)}>
-                {preset.label}
-              </button>
-            ))}
-          </div>
-        </div>
       </header>
+
+      <section className="card size-card">
+        <span className="field-label">Printer size</span>
+        <div className="segmented size-presets">
+          {PAPER_PRESETS.map((preset) => (
+            <button key={preset.id} className={activePresetId === preset.id ? 'active' : ''} onClick={() => applyPreset(preset)}>
+              {preset.label}
+            </button>
+          ))}
+          <button className={activePresetId === 'custom' ? 'active' : ''} onClick={() => updatePrinterSize({ id: 'custom' })}>
+            Custom
+          </button>
+        </div>
+        <div className="size-grid">
+          <label className="field">
+            <span className="field-label">Paper width (mm)</span>
+            <input
+              type="number"
+              min="20"
+              max="112"
+              inputMode="decimal"
+              value={printerSize.paperMm}
+              onChange={(event) => updatePrinterSize({ paperMm: event.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span className="field-label">Printable (mm)</span>
+            <input
+              type="number"
+              min="16"
+              max="104"
+              step="0.1"
+              inputMode="decimal"
+              value={printerSize.printableMm}
+              onChange={(event) => {
+                const printableMm = Number(event.target.value);
+                updatePrinterSize({
+                  printableMm,
+                  dots: dotsFromMm(printableMm, printerSize.dpi),
+                });
+              }}
+            />
+          </label>
+          <label className="field">
+            <span className="field-label">DPI</span>
+            <div className="segmented">
+              {[203, 300].map((dpi) => (
+                <button
+                  key={dpi}
+                  type="button"
+                  className={printerSize.dpi === dpi ? 'active' : ''}
+                  onClick={() => updatePrinterSize({ dpi, dots: dotsFromMm(printerSize.printableMm, dpi) })}
+                >
+                  {dpi}
+                </button>
+              ))}
+            </div>
+          </label>
+          <label className="field">
+            <span className="field-label">Print dots</span>
+            <input
+              type="number"
+              min="64"
+              max="1024"
+              step="8"
+              inputMode="numeric"
+              value={printerSize.dots}
+              onChange={(event) => updatePrinterSize({ dots: event.target.value })}
+            />
+          </label>
+        </div>
+        <p className="hint">
+          Printing at {printerSize.dots} dots on {printerSize.paperMm} mm paper ({printerSize.printableMm} mm printable at {printerSize.dpi} DPI). If the image is cut off, lower dots. If you see a white side margin, raise dots.
+        </p>
+      </section>
 
       <div className="segmented" role="tablist">
         <button className={mode === 'text' ? 'active' : ''} onClick={() => setMode('text')}>
